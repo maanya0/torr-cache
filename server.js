@@ -14,6 +14,7 @@ const TIMEOUT_MS = 120000;
 const PUBLIC_URL = process.env.PUBLIC_URL || null;
 const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+// --- Agents ---
 const originAgent = {
     http: new http.Agent({ keepAlive: true, maxSockets: 100 }),
     https: new https.Agent({ keepAlive: true, maxSockets: 100 })
@@ -28,7 +29,7 @@ function getHash(str) {
     return crypto.createHash('sha1').update(str).digest('hex').slice(0, 16);
 }
 
-// --- Endpoint 1: The Cache Unit ---
+// --- Endpoint 1: The Cache Unit (Cloudflare sees this) ---
 app.get('/chunk', async (req, res) => {
     const { url, idx } = req.query;
     if (!url || idx === undefined) return res.status(400).send('Missing args');
@@ -53,6 +54,10 @@ app.get('/chunk', async (req, res) => {
                 return;
             }
 
+            // --- THE FIX ---
+            // Only send Content-Length if Origin provides it.
+            // If we force it to 20MB but Origin sends 13KB, the download fails.
+            
             const headers = {
                 'Content-Type': originRes.headers['content-type'] || 'application/octet-stream',
                 'Cache-Control': 'public, max-age=31536000, immutable',
@@ -61,6 +66,7 @@ app.get('/chunk', async (req, res) => {
                 'Access-Control-Allow-Origin': '*' 
             };
 
+            // Only add Length if strictly known. Otherwise, let it be Chunked.
             if (originRes.headers['content-length']) {
                 headers['Content-Length'] = originRes.headers['content-length'];
             }
@@ -149,44 +155,25 @@ app.get('/media', async (req, res) => {
             }
         };
 
-        // Helper to fetch with retry logic
+        // Helper to fetch
         const fetchChunk = async (idx) => {
-             // Try up to 3 times to get a "Full" chunk
-             for (let attempt = 1; attempt <= 3; attempt++) {
+             for (let attempt = 1; attempt <= 2; attempt++) { // Reduced retries to avoid hanging
                  try {
                      const response = await got(getChunkUrl(idx), fetchOptions);
                      const buffer = response.body;
                      
-                     // HTML Challenge Check
                      if (buffer.length < 20000 && buffer.toString().includes('<!DOCTYPE html>')) {
                         console.error(`[CRITICAL] Cloudflare Challenge triggered on chunk ${idx}`);
                         return { buffer, status: 'blocked' };
                      }
-
-                     // Check if this is a "Short Read"
-                     // i.e., Buffer is small, but we expect more data based on totalSize
-                     const chunkStart = idx * CHUNK_SIZE;
-                     const expectedMinSize = (totalSize && (chunkStart + CHUNK_SIZE < totalSize)) 
-                                             ? CHUNK_SIZE 
-                                             : buffer.length; // If last chunk, any size is fine
-
-                     if (buffer.length < expectedMinSize && buffer.length < CHUNK_SIZE) {
-                         console.log(`[Chunk ${idx}] Short read (${buffer.length} bytes). Attempt ${attempt}/3...`);
-                         // Wait 1s for TorrServer to buffer
-                         await new Promise(r => setTimeout(r, 1000));
-                         continue; 
-                     }
-                     
                      return { buffer, status: 'ok' };
                  } catch (e) {
-                     console.error(`Attempt ${attempt} failed for chunk ${idx}: ${e.message}`);
                      await new Promise(r => setTimeout(r, 1000));
                  }
              }
-             return { buffer: Buffer.alloc(0), status: 'failed' }; // Give up
+             return { buffer: Buffer.alloc(0), status: 'failed' };
         };
 
-        // Prefetch Start
         let nextChunkPromise = fetchChunk(currentIdx);
 
         while (!needsToStop) {
@@ -196,7 +183,6 @@ app.get('/media', async (req, res) => {
 
             if (result.status === 'blocked' || result.status === 'failed') break;
 
-            // Prefetch Next
             const nextIdx = currentIdx + 1;
             const nextStart = nextIdx * CHUNK_SIZE;
             const isLast = (totalSize && nextStart >= totalSize) || (endByte !== null && nextStart > endByte);
@@ -209,7 +195,7 @@ app.get('/media', async (req, res) => {
 
             let buffer = result.buffer;
 
-            // Slice & Send
+            // Slicing Logic
             if (currentIdx === startChunkIdx) {
                 const relativeStart = startByte % CHUNK_SIZE;
                 if (relativeStart > 0) buffer = buffer.slice(relativeStart);
@@ -224,7 +210,8 @@ app.get('/media', async (req, res) => {
                 }
             }
             
-            // Only stop if we are truly at EOF based on Total Size
+            // Logic Update: If buffer is small (header) but we aren't at end of file,
+            // we do NOT stop. We just write it and move to next chunk.
             const isEndOfFile = totalSize && (currentIdx * CHUNK_SIZE + result.buffer.length >= totalSize);
             if (result.status === 'eof' || isEndOfFile) needsToStop = true;
 
