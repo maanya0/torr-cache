@@ -9,24 +9,24 @@ const app = express();
 // --- Configuration ---
 const PORT = process.env.PORT || 8080;
 const CHUNK_SIZE = 20 * 1024 * 1024; // 20MB
-const TIMEOUT_MS = 30000; 
+const TIMEOUT_MS = 120000; // 2 mins buffering time
 
-// CRITICAL: Set this to your Cloudflare domain
 const PUBLIC_URL = process.env.PUBLIC_URL || null;
-
-// Fake Browser User-Agent to bypass Cloudflare Bot Protection
 const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// --- Connection Pooling ---
-const agentOptions = {
-    keepAlive: true,
-    keepAliveMsecs: 1000,
-    maxSockets: 500
+// --- Agents ---
+// 1. Origin Agent (Keep-Alive is GOOD here for TorrServer performance)
+const originAgent = {
+    http: new http.Agent({ keepAlive: true, maxSockets: 100 }),
+    https: new https.Agent({ keepAlive: true, maxSockets: 100 })
 };
-const httpAgent = new http.Agent(agentOptions);
-const httpsAgent = new https.Agent(agentOptions);
 
-// --- Helpers ---
+// 2. Internal Loop Agent (Keep-Alive is RISKY here, disable it to prevent hangs)
+const internalAgent = {
+    http: new http.Agent({ keepAlive: false }),
+    https: new https.Agent({ keepAlive: false })
+};
+
 function getHash(str) {
     return crypto.createHash('sha1').update(str).digest('hex').slice(0, 16);
 }
@@ -44,8 +44,8 @@ app.get('/chunk', async (req, res) => {
         const stream = got.stream(url, {
             headers: { 'Range': `bytes=${start}-${end}` },
             timeout: { request: TIMEOUT_MS },
-            retry: { limit: 2, methods: ['GET'] },
-            agent: { http: httpAgent, https: httpsAgent },
+            retry: { limit: 5, methods: ['GET'] },
+            agent: originAgent, // Use pooled connection for Origin
             isStream: true
         });
 
@@ -56,18 +56,23 @@ app.get('/chunk', async (req, res) => {
                 return;
             }
 
-            const chunkLength = originRes.headers['content-length'] || (end - start + 1);
-
-            // Nuclear Fix: Force 200 OK + Whitelist Headers
+            // --- STABILITY FIX ---
+            // Don't guess Content-Length. Only pass it if Origin sends it.
+            // If missing, Node will use 'Transfer-Encoding: chunked' automatically.
+            // This prevents "Downloaded 13KB of 20MB" errors.
             const headers = {
                 'Content-Type': originRes.headers['content-type'] || 'application/octet-stream',
-                'Content-Length': chunkLength,
                 'Cache-Control': 'public, max-age=31536000, immutable',
                 'ETag': `"${getHash(url)}-${chunkIndex}"`,
                 'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT',
                 'Access-Control-Allow-Origin': '*' 
             };
 
+            if (originRes.headers['content-length']) {
+                headers['Content-Length'] = originRes.headers['content-length'];
+            }
+
+            // Force 200 OK to trigger Cloudflare Cache
             res.writeHead(200, headers);
         });
         
@@ -79,7 +84,6 @@ app.get('/chunk', async (req, res) => {
         stream.pipe(res);
 
     } catch (e) { 
-        console.error(`Setup error chunk ${chunkIndex}: ${e.message}`);
         if (!res.headersSent) res.status(500).end(); 
     }
 });
@@ -96,18 +100,15 @@ app.get('/media', async (req, res) => {
         // 1. Get Metadata
         const headRes = await got.head(originUrl, {
             timeout: { request: 5000 },
-            agent: { http: httpAgent, https: httpsAgent }
+            agent: originAgent
         }).catch(() => null);
 
         const totalSize = headRes && headRes.headers['content-length'] ? parseInt(headRes.headers['content-length'], 10) : 0;
         const contentType = (headRes && headRes.headers['content-type']) || 'video/x-matroska';
         
         // 2. Headers
-        const fileETag = `"${getHash(originUrl)}"`;
-        const lastModified = "Mon, 01 Jan 2024 00:00:00 GMT";
-
-        res.setHeader('ETag', fileETag);
-        res.setHeader('Last-Modified', lastModified);
+        res.setHeader('ETag', `"${getHash(originUrl)}"`);
+        res.setHeader('Last-Modified', "Mon, 01 Jan 2024 00:00:00 GMT");
         res.setHeader('Accept-Ranges', 'bytes');
         res.setHeader('Content-Type', contentType);
         res.setHeader('Cache-Control', 'no-cache');
@@ -142,13 +143,18 @@ app.get('/media', async (req, res) => {
         let currentIdx = startChunkIdx;
         let needsToStop = false;
 
-        // --- UPDATED: Add User-Agent to internal requests ---
         const fetchOptions = {
             responseType: 'buffer', 
             timeout: { request: TIMEOUT_MS }, 
             https: { rejectUnauthorized: false }, 
-            agent: { http: httpAgent, https: httpsAgent },
-            headers: { 'User-Agent': BROWSER_UA } // Spoof Browser
+            agent: internalAgent, // Use fresh sockets
+            http2: false, // FORCE HTTP/1.1 for stability
+            throwHttpErrors: false, 
+            headers: { 
+                'User-Agent': BROWSER_UA,
+                'Referer': PUBLIC_URL,
+                'Connection': 'close' // Ensure no socket reuse
+            }
         };
 
         let nextChunkPromise = got(getChunkUrl(currentIdx), fetchOptions);
@@ -156,9 +162,8 @@ app.get('/media', async (req, res) => {
         while (!needsToStop) {
             let response;
             try { response = await nextChunkPromise; } 
-            catch (e) { console.error(`Fetch error chunk ${currentIdx}: ${e.message}`); break; }
+            catch (e) { console.error(`Fetch error ${currentIdx}: ${e.message}`); break; }
 
-            // Prefetch Next
             const nextIdx = currentIdx + 1;
             const nextStart = nextIdx * CHUNK_SIZE;
             const isLast = (totalSize && nextStart >= totalSize) || (endByte !== null && nextStart > endByte);
@@ -171,13 +176,13 @@ app.get('/media', async (req, res) => {
 
             let buffer = response.body;
 
-            // Debug: Check if we got a Cloudflare Block Page
+            // HTML Challenge Check
             if (buffer.length < 20000 && buffer.toString().includes('<!DOCTYPE html>')) {
-                console.error("CRITICAL: Cloudflare blocked internal request! Check WAF settings.");
+                console.error(`[CRITICAL] Cloudflare Challenge triggered on chunk ${currentIdx}`);
                 needsToStop = true;
             }
 
-            // Slicing
+            // Slice & Send
             if (currentIdx === startChunkIdx) {
                 const relativeStart = startByte % CHUNK_SIZE;
                 if (relativeStart > 0) buffer = buffer.slice(relativeStart);
