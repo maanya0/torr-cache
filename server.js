@@ -3,33 +3,36 @@ const got = require('got');
 const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
-const { pipeline } = require('stream/promises');
 
 const app = express();
 
 // --- Configuration ---
-const PORT = process.env.PORT || 8080; // Matching your deployed port
-const CHUNK_SIZE = 20 * 1024 * 1024; // 20 MiB
-const TIMEOUT_MS = 30000; 
+const PORT = process.env.PORT || 8080;
+// 20MB is the sweet spot for 4K Remuxes. 
+// It reduces HTTP overhead while keeping chunks small enough to manage.
+const CHUNK_SIZE = 20 * 1024 * 1024; 
+const TIMEOUT_MS = 30000; // 30s timeout for sluggish TorrServer peers
 
-// IMPORTANT: Set this to your Cloudflare domain (e.g. https://stream.hyper154.pw)
-// If not set, it defaults to localhost (which bypasses Cloudflare cache for internal fetches)
+// CRITICAL: Set this to your Cloudflare URL (e.g. https://stream.yourdomain.com)
+// If null, it falls back to localhost (Playback works, but caching fails).
 const PUBLIC_URL = process.env.PUBLIC_URL || null;
 
 // --- Connection Pooling ---
+// Reuses TCP connections to avoid SSL handshake overhead for every chunk
 const agentOptions = {
     keepAlive: true,
     keepAliveMsecs: 1000,
-    maxSockets: 100
+    maxSockets: 500 // Allow high concurrency for prefetching
 };
 const httpAgent = new http.Agent(agentOptions);
 const httpsAgent = new https.Agent(agentOptions);
 
+// --- Helpers ---
 function getFileHash(url) {
     return crypto.createHash('sha1').update(url).digest('hex').slice(0, 8);
 }
 
-// --- Endpoint 1: Single Chunk ---
+// --- Endpoint 1: The Cache Unit (Cloudflare sees this) ---
 app.get('/chunk', async (req, res) => {
     const { url, idx } = req.query;
 
@@ -40,156 +43,181 @@ app.get('/chunk', async (req, res) => {
     const end = start + CHUNK_SIZE - 1;
 
     try {
+        // Stream directly from Origin (TorrServer)
         const stream = got.stream(url, {
             headers: { 'Range': `bytes=${start}-${end}` },
             timeout: { request: TIMEOUT_MS },
-            retry: { limit: 2 },
+            retry: { limit: 2, methods: ['GET'] },
             agent: { http: httpAgent, https: httpsAgent },
             isStream: true
         });
 
         stream.on('response', (originRes) => {
+            // Forward errors appropriately
             if (originRes.statusCode >= 400) {
-                res.status(originRes.statusCode).send('Origin Error');
-                stream.destroy(); 
+                console.error(`[Chunk ${chunkIndex}] Origin Error: ${originRes.statusCode}`);
+                res.status(originRes.statusCode).end();
+                stream.destroy();
                 return;
             }
 
+            // Set Headers for Cloudflare Caching
             res.setHeader('Content-Type', originRes.headers['content-type'] || 'application/octet-stream');
             res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
             res.setHeader('ETag', `"${getFileHash(url)}-${chunkIndex}"`);
+            
+            // Return 200 OK so Cloudflare stores this "file"
             res.status(200);
         });
 
         stream.on('error', (err) => {
-            if (!res.headersSent) res.status(502).send('Bad Gateway');
+            console.error(`[Chunk ${chunkIndex}] Stream Error: ${err.message}`);
+            if (!res.headersSent) res.status(502).end();
         });
 
-        await pipeline(stream, res).catch(() => {});
+        stream.pipe(res);
 
     } catch (err) {
-        if (!res.headersSent) res.status(500).send('Internal Server Error');
+        if (!res.headersSent) res.status(500).send('Internal Error');
     }
 });
 
-// --- Endpoint 2: Media Stitcher (Now with Size Support) ---
+// --- Endpoint 2: The Player Interface (You see this) ---
 app.get('/media', async (req, res) => {
     const originUrl = req.query.url;
     if (!originUrl) return res.status(400).send('Missing url');
 
-    // Default to Localhost if PUBLIC_URL is missing to ensure internal fetching works
-    const selfHost = PUBLIC_URL || `http://127.0.0.1:${PORT}`;
+    // Determine where to fetch chunks from. 
+    // Ideally PUBLIC_URL (Cloudflare), fallback to Localhost.
+    const internalHost = PUBLIC_URL || `http://127.0.0.1:${PORT}`;
+    
+    // Helper to generate fetch URL
+    const getChunkUrl = (i) => `${internalHost}/chunk?url=${encodeURIComponent(originUrl)}&idx=${i}`;
 
     try {
-        // STEP 1: Get File Metadata (Total Size)
-        // We MUST know the size to support seeking/resuming
-        const headResponse = await got.head(originUrl, {
+        // 1. HEAD Request: Get Total File Size
+        // Essential for "Resume" functionality and Seeking
+        const headRes = await got.head(originUrl, {
             timeout: { request: 5000 },
-            agent: { http: httpAgent, https: httpsAgent },
-            retry: { limit: 1 }
-        });
+            agent: { http: httpAgent, https: httpsAgent }
+        }).catch(e => null); // If HEAD fails, we proceed with unknown size
 
-        const totalSize = parseInt(headResponse.headers['content-length'], 10);
-        if (isNaN(totalSize)) {
-            console.warn('Origin did not return content-length');
-        }
+        const totalSize = headRes && headRes.headers['content-length'] 
+            ? parseInt(headRes.headers['content-length'], 10) 
+            : 0;
+        
+        const contentType = (headRes && headRes.headers['content-type']) || 'video/x-matroska';
 
-        // STEP 2: Parse Range Header from Client
+        // 2. Parse Range Header (bytes=12345-)
         const rangeHeader = req.headers.range || 'bytes=0-';
         const rangeMatch = rangeHeader.match(/bytes=(\d+)-(\d*)/);
         
-        let startByte = 0;
-        let endByte = totalSize ? totalSize - 1 : null; // Default to full file if known
-        
-        if (rangeMatch) {
-            startByte = parseInt(rangeMatch[1], 10);
-            if (rangeMatch[2]) {
-                endByte = parseInt(rangeMatch[2], 10);
-            }
-        }
+        let startByte = rangeMatch ? parseInt(rangeMatch[1], 10) : 0;
+        let endByte = (rangeMatch && rangeMatch[2]) ? parseInt(rangeMatch[2], 10) : (totalSize ? totalSize - 1 : null);
 
-        // Sanity check: if client asks for range beyond file size
+        // Sanity Check
         if (totalSize && startByte >= totalSize) {
             res.setHeader('Content-Range', `bytes */${totalSize}`);
             return res.status(416).send('Requested Range Not Satisfiable');
         }
 
-        // STEP 3: Send Response Headers
-        res.status(206); // Partial Content
-        res.setHeader('Content-Type', headResponse.headers['content-type'] || 'video/x-matroska');
+        // 3. Send Response Headers (206 Partial Content)
+        res.status(206);
+        res.setHeader('Content-Type', contentType);
         res.setHeader('Accept-Ranges', 'bytes');
-        res.setHeader('Cache-Control', 'no-cache'); // Don't cache the stitcher, only the chunks
-        
-        // Correct Content-Length is vital for progress bars
-        if (endByte !== null) {
+        res.setHeader('Cache-Control', 'no-cache'); // Don't cache the stream, only chunks
+
+        if (endByte !== null && totalSize) {
             res.setHeader('Content-Length', endByte - startByte + 1);
-            res.setHeader('Content-Range', `bytes ${startByte}-${endByte}/${totalSize || '*'}`);
+            res.setHeader('Content-Range', `bytes ${startByte}-${endByte}/${totalSize}`);
         } else {
-             // Fallback if size is truly unknown (rare)
-             res.setHeader('Content-Range', `bytes ${startByte}-/*`);
+            res.setHeader('Content-Range', `bytes ${startByte}-/*`);
         }
 
-        // STEP 4: Streaming Loop
+        // 4. PREFETCHING LOOP LOGIC
         const startChunkIdx = Math.floor(startByte / CHUNK_SIZE);
-        let currentChunkIdx = startChunkIdx;
+        let currentIdx = startChunkIdx;
         let needsToStop = false;
 
-        while (!needsToStop) {
-            const chunkUrl = `${selfHost}/chunk?url=${encodeURIComponent(originUrl)}&idx=${currentChunkIdx}`;
+        // Initialize the promise for the FIRST chunk
+        let nextChunkPromise = got(getChunkUrl(currentIdx), {
+            responseType: 'buffer',
+            timeout: { request: TIMEOUT_MS },
+            https: { rejectUnauthorized: false }, // Allow self-signed/internal SSL
+            agent: { http: httpAgent, https: httpsAgent }
+        });
 
+        while (!needsToStop) {
+            // A. Wait for the CURRENT chunk to arrive
+            let response;
             try {
-                // Buffer 10MB chunk for processing
-                const response = await got(chunkUrl, { 
+                response = await nextChunkPromise;
+            } catch (err) {
+                console.error(`Error fetching internal chunk ${currentIdx}: ${err.message}`);
+                break;
+            }
+
+            // B. IMMEDIATE PREFETCH: Start downloading NEXT chunk in background
+            // We do this BEFORE we process/send the current data
+            const nextIdx = currentIdx + 1;
+            const nextChunkStart = nextIdx * CHUNK_SIZE;
+            
+            // Only prefetch if we haven't reached the end of the file or requested range
+            const isLastChunk = (totalSize && nextChunkStart >= totalSize) || (endByte !== null && nextChunkStart > endByte);
+            
+            if (!isLastChunk && nextIdx < 20000) {
+                nextChunkPromise = got(getChunkUrl(nextIdx), {
                     responseType: 'buffer',
                     timeout: { request: TIMEOUT_MS },
-                    https: { rejectUnauthorized: false }, // Ignore SSL errors for internal localhost
+                    https: { rejectUnauthorized: false },
                     agent: { http: httpAgent, https: httpsAgent }
                 });
-
-                let buffer = response.body;
-
-                // Slice Start (if inside the first requested chunk)
-                if (currentChunkIdx === startChunkIdx) {
-                    const relativeStart = startByte % CHUNK_SIZE;
-                    if (relativeStart > 0) buffer = buffer.slice(relativeStart);
-                }
-
-                // Slice End (if we reached the end of the requested range)
-                if (endByte !== null) {
-                    const chunkStartPos = currentChunkIdx * CHUNK_SIZE;
-                    // Position of the buffer's start in the real file
-                    const bufferAbsStart = chunkStartPos + (currentChunkIdx === startChunkIdx ? (startByte % CHUNK_SIZE) : 0);
-                    const bytesNeeded = (endByte + 1) - bufferAbsStart;
-                    
-                    if (buffer.length > bytesNeeded) {
-                        buffer = buffer.slice(0, bytesNeeded);
-                        needsToStop = true; // We found the end
-                    }
-                }
-
-                const keepGoing = res.write(buffer);
-                if (!keepGoing) await new Promise(resolve => res.once('drain', resolve));
-
-                currentChunkIdx++;
-                
-                // End loop conditions
-                if (response.body.length < CHUNK_SIZE) needsToStop = true; // EOF from origin
-                if (totalSize && (currentChunkIdx * CHUNK_SIZE > endByte)) needsToStop = true; // EOF from calc
-                if (currentChunkIdx > 20000) needsToStop = true; // Safety
-
-            } catch (err) {
-                console.error(`Error fetching chunk ${currentChunkIdx}: ${err.message}`);
-                needsToStop = true;
+            } else {
+                nextChunkPromise = Promise.resolve(null); // No more chunks needed
             }
+
+            // C. Process Current Chunk (Slicing)
+            let buffer = response.body;
+
+            // Slice Start (for seek/resume)
+            if (currentIdx === startChunkIdx) {
+                const relativeStart = startByte % CHUNK_SIZE;
+                if (relativeStart > 0) buffer = buffer.slice(relativeStart);
+            }
+
+            // Slice End (for end of file/range)
+            if (endByte !== null) {
+                const chunkStartPos = currentIdx * CHUNK_SIZE;
+                const bufferAbsStart = chunkStartPos + (currentIdx === startChunkIdx ? (startByte % CHUNK_SIZE) : 0);
+                const bytesNeeded = (endByte + 1) - bufferAbsStart;
+                if (buffer.length > bytesNeeded) {
+                    buffer = buffer.slice(0, bytesNeeded);
+                    needsToStop = true; // We are done after this write
+                }
+            }
+
+            // Check for EOF from Origin (Chunk smaller than expected)
+            if (response.body.length < CHUNK_SIZE) needsToStop = true;
+
+            // D. Send to Client
+            const keepGoing = res.write(buffer);
+            if (!keepGoing) {
+                // If client is slow, wait for 'drain' event
+                await new Promise(resolve => res.once('drain', resolve));
+            }
+
+            currentIdx++;
+            if (currentIdx > 20000) needsToStop = true; // Safety limit (400GB)
         }
+
         res.end();
 
     } catch (err) {
-        console.error('Metadata fetch error:', err.message);
-        if (!res.headersSent) res.status(502).send('Could not fetch file metadata');
+        console.error('Stream error:', err.message);
+        if (!res.headersSent) res.end();
     }
 });
 
-app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Proxy running on port ${PORT}`));
 
 
