@@ -9,19 +9,16 @@ const app = express();
 // --- Configuration ---
 const PORT = process.env.PORT || 8080;
 const CHUNK_SIZE = 20 * 1024 * 1024; // 20MB
-const TIMEOUT_MS = 120000; // 2 mins buffering time
+const TIMEOUT_MS = 120000; 
 
 const PUBLIC_URL = process.env.PUBLIC_URL || null;
 const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// --- Agents ---
-// 1. Origin Agent (Keep-Alive is GOOD here for TorrServer performance)
 const originAgent = {
     http: new http.Agent({ keepAlive: true, maxSockets: 100 }),
     https: new https.Agent({ keepAlive: true, maxSockets: 100 })
 };
 
-// 2. Internal Loop Agent (Keep-Alive is RISKY here, disable it to prevent hangs)
 const internalAgent = {
     http: new http.Agent({ keepAlive: false }),
     https: new https.Agent({ keepAlive: false })
@@ -45,7 +42,7 @@ app.get('/chunk', async (req, res) => {
             headers: { 'Range': `bytes=${start}-${end}` },
             timeout: { request: TIMEOUT_MS },
             retry: { limit: 5, methods: ['GET'] },
-            agent: originAgent, // Use pooled connection for Origin
+            agent: originAgent,
             isStream: true
         });
 
@@ -56,10 +53,6 @@ app.get('/chunk', async (req, res) => {
                 return;
             }
 
-            // --- STABILITY FIX ---
-            // Don't guess Content-Length. Only pass it if Origin sends it.
-            // If missing, Node will use 'Transfer-Encoding: chunked' automatically.
-            // This prevents "Downloaded 13KB of 20MB" errors.
             const headers = {
                 'Content-Type': originRes.headers['content-type'] || 'application/octet-stream',
                 'Cache-Control': 'public, max-age=31536000, immutable',
@@ -72,7 +65,6 @@ app.get('/chunk', async (req, res) => {
                 headers['Content-Length'] = originRes.headers['content-length'];
             }
 
-            // Force 200 OK to trigger Cloudflare Cache
             res.writeHead(200, headers);
         });
         
@@ -147,40 +139,75 @@ app.get('/media', async (req, res) => {
             responseType: 'buffer', 
             timeout: { request: TIMEOUT_MS }, 
             https: { rejectUnauthorized: false }, 
-            agent: internalAgent, // Use fresh sockets
-            http2: false, // FORCE HTTP/1.1 for stability
+            agent: internalAgent,
+            http2: false, 
             throwHttpErrors: false, 
             headers: { 
                 'User-Agent': BROWSER_UA,
                 'Referer': PUBLIC_URL,
-                'Connection': 'close' // Ensure no socket reuse
+                'Connection': 'close' 
             }
         };
 
-        let nextChunkPromise = got(getChunkUrl(currentIdx), fetchOptions);
+        // Helper to fetch with retry logic
+        const fetchChunk = async (idx) => {
+             // Try up to 3 times to get a "Full" chunk
+             for (let attempt = 1; attempt <= 3; attempt++) {
+                 try {
+                     const response = await got(getChunkUrl(idx), fetchOptions);
+                     const buffer = response.body;
+                     
+                     // HTML Challenge Check
+                     if (buffer.length < 20000 && buffer.toString().includes('<!DOCTYPE html>')) {
+                        console.error(`[CRITICAL] Cloudflare Challenge triggered on chunk ${idx}`);
+                        return { buffer, status: 'blocked' };
+                     }
+
+                     // Check if this is a "Short Read"
+                     // i.e., Buffer is small, but we expect more data based on totalSize
+                     const chunkStart = idx * CHUNK_SIZE;
+                     const expectedMinSize = (totalSize && (chunkStart + CHUNK_SIZE < totalSize)) 
+                                             ? CHUNK_SIZE 
+                                             : buffer.length; // If last chunk, any size is fine
+
+                     if (buffer.length < expectedMinSize && buffer.length < CHUNK_SIZE) {
+                         console.log(`[Chunk ${idx}] Short read (${buffer.length} bytes). Attempt ${attempt}/3...`);
+                         // Wait 1s for TorrServer to buffer
+                         await new Promise(r => setTimeout(r, 1000));
+                         continue; 
+                     }
+                     
+                     return { buffer, status: 'ok' };
+                 } catch (e) {
+                     console.error(`Attempt ${attempt} failed for chunk ${idx}: ${e.message}`);
+                     await new Promise(r => setTimeout(r, 1000));
+                 }
+             }
+             return { buffer: Buffer.alloc(0), status: 'failed' }; // Give up
+        };
+
+        // Prefetch Start
+        let nextChunkPromise = fetchChunk(currentIdx);
 
         while (!needsToStop) {
-            let response;
-            try { response = await nextChunkPromise; } 
-            catch (e) { console.error(`Fetch error ${currentIdx}: ${e.message}`); break; }
+            let result;
+            try { result = await nextChunkPromise; } 
+            catch (e) { break; }
 
+            if (result.status === 'blocked' || result.status === 'failed') break;
+
+            // Prefetch Next
             const nextIdx = currentIdx + 1;
             const nextStart = nextIdx * CHUNK_SIZE;
             const isLast = (totalSize && nextStart >= totalSize) || (endByte !== null && nextStart > endByte);
             
             if (!isLast && nextIdx < 20000) {
-                nextChunkPromise = got(getChunkUrl(nextIdx), fetchOptions);
+                nextChunkPromise = fetchChunk(nextIdx);
             } else {
-                nextChunkPromise = Promise.resolve(null);
+                nextChunkPromise = Promise.resolve({ buffer: Buffer.alloc(0), status: 'eof' });
             }
 
-            let buffer = response.body;
-
-            // HTML Challenge Check
-            if (buffer.length < 20000 && buffer.toString().includes('<!DOCTYPE html>')) {
-                console.error(`[CRITICAL] Cloudflare Challenge triggered on chunk ${currentIdx}`);
-                needsToStop = true;
-            }
+            let buffer = result.buffer;
 
             // Slice & Send
             if (currentIdx === startChunkIdx) {
@@ -197,7 +224,9 @@ app.get('/media', async (req, res) => {
                 }
             }
             
-            if (response.body.length < CHUNK_SIZE) needsToStop = true;
+            // Only stop if we are truly at EOF based on Total Size
+            const isEndOfFile = totalSize && (currentIdx * CHUNK_SIZE + result.buffer.length >= totalSize);
+            if (result.status === 'eof' || isEndOfFile) needsToStop = true;
 
             const keepGoing = res.write(buffer);
             if (!keepGoing) await new Promise(r => res.once('drain', r));
