@@ -1,0 +1,17 @@
+{
+  "name": "mkv-chunk-proxy",
+  "version": "2.0.0",
+  "description": "Optimized streaming proxy for caching large files on Cloudflare",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "got": "^11.8.6"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
+
