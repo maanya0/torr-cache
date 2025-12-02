@@ -8,11 +8,16 @@ const app = express();
 
 // --- Configuration ---
 const PORT = process.env.PORT || 8080;
+// 20MB chunks: Best balance for 4K Remuxes
 const CHUNK_SIZE = 20 * 1024 * 1024; 
 const TIMEOUT_MS = 30000; 
+
+// CRITICAL: Set this to your Cloudflare domain (e.g. https://stream.yourdomain.com)
+// If null, it defaults to localhost (Caching will NOT work, but playback will).
 const PUBLIC_URL = process.env.PUBLIC_URL || null;
 
 // --- Connection Pooling ---
+// Keeps TCP connections open to TorrServer to reduce latency
 const agentOptions = {
     keepAlive: true,
     keepAliveMsecs: 1000,
@@ -36,31 +41,8 @@ app.get('/chunk', async (req, res) => {
     const end = start + CHUNK_SIZE - 1;
 
     try {
-        // Create cache key and set headers IMMEDIATELY
-        const cacheKey = getHash(url);
-        const chunkHash = `${cacheKey}-${chunkIndex}`;
-        
-        // CRITICAL FIX: Set headers BEFORE making upstream request
-        // Cloudflare decides cache status based on initial headers
-        const headers = {
-            'Content-Type': 'video/x-matroska', // Default, will update if needed
-            'Cache-Control': 'public, max-age=31536000, immutable, s-maxage=31536000',
-            'ETag': `"${chunkHash}"`,
-            'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT',
-            'Access-Control-Allow-Origin': '*',
-            'Accept-Ranges': 'none', // Important: Tell Cloudflare this is NOT a partial response
-            'X-Cache-Key': chunkHash,
-            'Vary': 'Accept-Encoding'
-        };
-        
-        // FORCE 200 OK - Cloudflare only caches 200 responses
-        res.writeHead(200, headers);
-
         const stream = got.stream(url, {
-            headers: { 
-                'Range': `bytes=${start}-${end}`,
-                'User-Agent': 'Mozilla/5.0'
-            },
+            headers: { 'Range': `bytes=${start}-${end}` },
             timeout: { request: TIMEOUT_MS },
             retry: { limit: 2, methods: ['GET'] },
             agent: { http: httpAgent, https: httpsAgent },
@@ -70,44 +52,43 @@ app.get('/chunk', async (req, res) => {
         stream.on('response', (originRes) => {
             // Forward errors immediately
             if (originRes.statusCode >= 400) {
-                // If headers already sent, just end the stream
-                if (res.headersSent) {
-                    stream.destroy();
-                    res.end();
-                } else {
-                    res.status(originRes.statusCode).end();
-                    stream.destroy();
-                }
+                res.status(originRes.statusCode).end();
+                stream.destroy();
                 return;
             }
 
-            // Update content type if available from origin
-            if (originRes.headers['content-type']) {
-                res.setHeader('Content-Type', originRes.headers['content-type']);
-            }
+            // Calculate the exact size of this chunk
+            const chunkLength = originRes.headers['content-length'] || (end - start + 1);
+
+            // --- THE NUCLEAR FIX ---
+            // We use res.writeHead(200) to forcefully overwrite the status code.
+            // This prevents the Origin's "206 Partial Content" from leaking through.
+            // We manually construct the header whitelist to ensure Cloudflare caches it.
             
-            // Set actual content length from origin
-            const contentLength = originRes.headers['content-length'] || (end - start + 1);
-            res.setHeader('Content-Length', contentLength);
-            
-            // CRITICAL: Remove any range-related headers that might leak through
-            // Cloudflare will NOT cache if it sees Content-Range
-            res.removeHeader('Content-Range');
-            res.removeHeader('Accept-Ranges');
-            
-            // Additional Cloudflare optimization headers
-            res.setHeader('CDN-Cache-Control', 'public, max-age=31536000');
-            res.setHeader('Edge-Cache-Tag', `chunk-${chunkHash}`);
+            const headers = {
+                // 1. Content Type & Length
+                'Content-Type': originRes.headers['content-type'] || 'application/octet-stream',
+                'Content-Length': chunkLength,
+                
+                // 2. Caching Headers (Forces Cloudflare to HIT)
+                'Cache-Control': 'public, max-age=31536000, immutable',
+                'ETag': `"${getHash(url)}-${chunkIndex}"`,
+                'Last-Modified': 'Mon, 01 Jan 2024 00:00:00 GMT', // Static date
+                
+                // 3. Allow CORS so your browser doesn't complain
+                'Access-Control-Allow-Origin': '*' 
+            };
+
+            // Write headers immediately. This locks the status as 200.
+            res.writeHead(200, headers);
         });
         
         stream.on('error', (err) => { 
             console.error(`Stream error chunk ${chunkIndex}: ${err.message}`);
             // Only send error if headers haven't been sent yet
             if (!res.headersSent) res.status(502).end(); 
-            else res.end(); // If headers sent, just end gracefully
         });
 
-        // Pipe the stream - any upstream 206 is now converted to our 200
         stream.pipe(res);
 
     } catch (e) { 
@@ -123,8 +104,6 @@ app.get('/media', async (req, res) => {
 
     // Use PUBLIC_URL to trigger the Cloudflare Loop, fallback to localhost for internal calls
     const internalHost = PUBLIC_URL || `http://127.0.0.1:${PORT}`;
-    // Add hash to URL for better cache consistency
-    const fileHash = getHash(originUrl);
     const getChunkUrl = (i) => `${internalHost}/chunk?url=${encodeURIComponent(originUrl)}&idx=${i}`;
 
     try {
@@ -138,18 +117,14 @@ app.get('/media', async (req, res) => {
         const contentType = (headRes && headRes.headers['content-type']) || 'video/x-matroska';
         
         // 2. Generate Validation Headers (Required for Resume)
-        const fileETag = `"${fileHash}"`;
+        const fileETag = `"${getHash(originUrl)}"`;
         const lastModified = "Mon, 01 Jan 2024 00:00:00 GMT";
 
-        // Set CORS headers first
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, ETag');
-        
         res.setHeader('ETag', fileETag);
         res.setHeader('Last-Modified', lastModified);
         res.setHeader('Accept-Ranges', 'bytes');
         res.setHeader('Content-Type', contentType);
-        res.setHeader('Cache-Control', 'no-cache, no-store'); // Don't cache the stitcher
+        res.setHeader('Cache-Control', 'no-cache'); // Don't cache the stitcher, only chunks
 
         // 3. Handle Range Header from Client
         const rangeHeader = req.headers.range;
@@ -196,19 +171,15 @@ app.get('/media', async (req, res) => {
         while (!needsToStop) {
             // A. Wait for Current Chunk
             let response;
-            try { 
-                response = await nextChunkPromise; 
-            } catch (e) { 
-                console.error(`Fetch error chunk ${currentIdx}: ${e.message}`); 
-                break; 
-            }
+            try { response = await nextChunkPromise; } 
+            catch (e) { console.error(`Fetch error chunk ${currentIdx}: ${e.message}`); break; }
 
             // B. Prefetch Next Chunk (Background)
             const nextIdx = currentIdx + 1;
             const nextStart = nextIdx * CHUNK_SIZE;
             const isLast = (totalSize && nextStart >= totalSize) || (endByte !== null && nextStart > endByte);
             
-            // Limit prefetching to valid range and sane number of chunks
+            // Limit prefetching to valid range and sane number of chunks (20,000 ~ 400GB)
             if (!isLast && nextIdx < 20000) {
                 nextChunkPromise = got(getChunkUrl(nextIdx), {
                     responseType: 'buffer',
@@ -239,7 +210,6 @@ app.get('/media', async (req, res) => {
                 }
             }
             
-            // If chunk is smaller than expected, we've reached the end
             if (response.body.length < CHUNK_SIZE) needsToStop = true;
 
             // D. Send to Client
@@ -247,61 +217,14 @@ app.get('/media', async (req, res) => {
             if (!keepGoing) await new Promise(r => res.once('drain', r));
 
             currentIdx++;
-            // Safety limit
             if (currentIdx > 20000) needsToStop = true;
         }
 
         res.end();
 
     } catch (err) {
-        console.error(`Media endpoint error: ${err.message}`);
-        if (!res.headersSent) res.status(500).end();
+        if (!res.headersSent) res.end();
     }
 });
 
-// Add health check endpoint
-app.get('/health', (req, res) => {
-    res.json({ 
-        status: 'ok', 
-        timestamp: new Date().toISOString(),
-        chunkSize: `${CHUNK_SIZE / 1024 / 1024}MB`
-    });
-});
-
-// Add cache debug endpoint
-app.get('/debug-cache', async (req, res) => {
-    const { url, idx } = req.query;
-    if (!url || idx === undefined) {
-        return res.status(400).json({ error: 'Missing url or idx' });
-    }
-    
-    const testUrl = `${PUBLIC_URL || `http://localhost:${PORT}`}/chunk?url=${encodeURIComponent(url)}&idx=${idx}`;
-    
-    try {
-        const response = await got(testUrl, {
-            headers: { 'User-Agent': 'Cache-Debug/1.0' },
-            timeout: 10000
-        });
-        
-        res.json({
-            url: testUrl,
-            status: response.statusCode,
-            headers: response.headers,
-            cacheStatus: response.headers['cf-cache-status'] || 'unknown',
-            cacheControl: response.headers['cache-control'],
-            hasContentRange: !!response.headers['content-range']
-        });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.listen(PORT, () => {
-    console.log(`🚀 Cloudflare Cache Proxy running on port ${PORT}`);
-    console.log(`📦 Chunk size: ${CHUNK_SIZE / 1024 / 1024}MB`);
-    console.log(`🌐 Public URL: ${PUBLIC_URL || 'Not set (caching disabled)'}`);
-    if (!PUBLIC_URL) {
-        console.log('⚠️  WARNING: PUBLIC_URL not set. Cloudflare caching will NOT work.');
-        console.log('   Set PUBLIC_URL to your Cloudflare domain (e.g., https://stream.yourdomain.com)');
-    }
-});
+app.listen(PORT, () => console.log(`🚀 Proxy running on port ${PORT}`));
